@@ -1,34 +1,3 @@
-"""
-WhatsApp bulk sender with AI-generated messages (NVIDIA NIM),
-using Selenium for a single persistent WhatsApp Web session
-(no repeated tab-opening, no repeated QR scans after the first run).
-
-Requirements:
-    pip install selenium openai python-dotenv
-
-Setup:
-    Set your NVIDIA NIM API key either in a .env file in this same folder:
-        NVIDIA_API_KEY=your-api-key-here
-    or as an environment variable before running:
-        export NVIDIA_API_KEY="your-api-key-here"      (Linux/macOS)
-        $env:NVIDIA_API_KEY="your-api-key-here"         (Windows PowerShell)
-
-    Get a free key (email signup, no card) at build.nvidia.com.
-
-    Optionally override the model with the NIM_MODEL environment variable if
-    the default slug below ever 404s against NVIDIA's current catalog.
-
-    First run: a Chrome window opens to WhatsApp Web and shows a QR code.
-    Scan it once with your phone. Your login session is saved to the
-    'whatsapp_selenium_profile' folder (created next to this script), so
-    future runs won't ask for the QR code again.
-
-CSV format (whatsapp_context.csv):
-    Name,Context
-    +919819042429,"Write a short, warm 'Hi' message for my mother"
-    +919323096918,"Write a short, warm 'Hi' message for my father"
-"""
-
 import os
 import csv
 import time
@@ -56,7 +25,7 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-CSV_FILE = r"C:\Users\hp\OneDrive\Desktop\DESKTOP\Programming\Python\Sales Automation\data\whatsapp_context.csv"
+CSV_FILE = r"C:\Users\hp\OneDrive\Desktop\DESKTOP\Programming\Python\Sales Automation\data\sender.csv"
 
 # TEMPORARY: swapped to Groq to test whether NIM itself is the bottleneck.
 # Swap back to the NVIDIA NIM block below once confirmed.
@@ -102,7 +71,11 @@ CHAT_LOAD_TIMEOUT = 30
 # ---------------------------------------------------------------------------
 
 def load_contacts(csv_path: str) -> list[dict]:
-    """Read the CSV file and return a list of {"phone": ..., "prompt": ...} dicts."""
+    """Read sender.csv (produced by context.py) and return a list of
+    {"phone": ..., "prompt": ...} dicts, pulling the phone number from
+    `Number` and the outreach instruction from `WhatsApp_Context`.
+    `Email_Context` and `Email` columns, if present, are ignored here —
+    they're for a separate email sender."""
     contacts = []
 
     if not os.path.exists(csv_path):
@@ -113,8 +86,8 @@ def load_contacts(csv_path: str) -> list[dict]:
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for i, row in enumerate(reader, start=2):
-            phone = (row.get("Name") or "").strip()
-            prompt = (row.get("Context") or "").strip()
+            phone = (row.get("Number") or "").strip()
+            prompt = (row.get("WhatsApp_Context") or "").strip()
 
             if not phone:
                 print(f"Warning: row {i} has no phone number, skipping.")
