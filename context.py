@@ -1,44 +1,3 @@
-"""
-Context Generation Stage (Cerebras, with Groq + generic fallback)
-===================================================================
-
-Purpose: reads company_profile.csv (Lead_Generator.py's output) and, for
-every eligible lead, generates a personalized WhatsApp outreach
-*instruction* — NOT a finished message — that whatapp_sender.py's own
-Gemini call (get_ai_message()) will use as a prompt to actually draft the
-short message it sends.
-
-Critical contract (do not violate): whatapp_sender.py's load_contacts()
-reads a `Context` column and feeds it straight into Gemini as a prompt. If
-this file wrote a finished message instead of an instruction, Gemini would
-"rewrite" an already-final text and mangle it. Every value written to the
-Context column below must read like an instruction ("Write a short, warm
-WhatsApp message mentioning X, Y, in a friendly tone..."), never like a
-message itself.
-
-Where this fits in the pipeline:
-    Lead_Generator.py -> company_profile.csv -> context.py (THIS FILE)
-        -> whatsapp_context.csv -> whatapp_sender.py
-
-Setup before running:
-    pip install python-dotenv openai
-    Add to your .env (next to the existing GOOGLE_MAPS_API_KEY / GROQ_API_KEY):
-        CEREBRAS_API_KEY=your_cerebras_key_here
-        CEREBRAS_MODEL=llama-3.3-70b            (optional, this is the default)
-        GROQ_API_KEY=your_groq_key_here          (reused from Lead_Generator.py)
-        GROQ_MODEL=llama-3.3-70b-versatile       (optional, this is the default)
-
-Run:
-    python3 context.py
-    -> you'll be prompted for your final goal for these leads
-
-Output (in ./data/):
-    whatsapp_context.csv  -> Name, Context, Company, Email
-                              (Name/Context are whatapp_sender.py's fixed
-                              contract; Company/Email are extra columns for
-                              human traceability, ignored by the sender.)
-"""
-
 import csv
 import os
 import random
@@ -92,9 +51,9 @@ GROQ_RATE_LIMIT_BACKOFF = 20
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 COMPANY_PROFILE_CSV = os.path.join(DATA_DIR, "company_profile.csv")
-WHATSAPP_CONTEXT_CSV = os.path.join(DATA_DIR, "whatsapp_context.csv")
+SENDER_CSV = os.path.join(DATA_DIR, "sender.csv")
 
-WHATSAPP_CONTEXT_FIELDNAMES = ["Name", "Context", "Company", "Email"]
+SENDER_FIELDNAMES = ["Company", "WhatsApp_Context", "Email_Context", "Number", "Email"]
 
 _cerebras_client = None
 _groq_client = None
@@ -126,14 +85,22 @@ def _is_rate_limit_error(e: Exception) -> bool:
 
 
 # ---------------- Change 2: generic fallback line ----------------
-def build_fallback_line(goal: str) -> str:
+def build_fallback_line(goal: str, channel: str) -> str:
     """
     Returns a generic, goal-based instruction (NOT a finished message — see
     the contract note at the top of this file) to use when both the
-    Cerebras and Groq calls fail for a given lead. Depends only on `goal`,
-    not on any per-lead data — it's the safety net when a lead-specific
-    call can't be made at all.
+    Cerebras and Groq calls fail for a given lead. Depends only on `goal`
+    and `channel`, not on any per-lead data — it's the safety net when a
+    lead-specific call can't be made at all.
+
+    `channel` is "whatsapp" or "email".
     """
+    if channel == "email":
+        return (
+            f"Write a short, warm, professional email opening paragraph "
+            f"introducing myself in the context of: {goal}. Keep it under "
+            f"40 words."
+        )
     return (
         f"Write a short, friendly WhatsApp message introducing myself in the "
         f"context of: {goal}. Keep it warm and under 30 words."
@@ -141,20 +108,41 @@ def build_fallback_line(goal: str) -> str:
 
 
 # ---------------- Prompt construction ----------------
-def _build_prompt(company: str, fit_notes: str, goal: str) -> str:
+def _build_prompt(company: str, fit_notes: str, goal: str, channel: str) -> str:
+    """
+    `channel` is "whatsapp" or "email" — selects which outreach instruction
+    to ask the model for. Both branches produce an INSTRUCTION for another
+    AI to follow, never a finished message (see the contract note at the
+    top of this file).
+    """
+    if channel == "email":
+        medium_desc = "a short, warm, professional cold-email opening paragraph"
+        format_hint = (
+            "Respond with ONLY the single instruction sentence (something like "
+            "'Write a short, warm email opener mentioning ... in a "
+            "professional but friendly tone, under 100 words.'). No preamble, "
+            "no quotes, no markdown."
+        )
+    else:
+        medium_desc = "a short, warm WhatsApp message"
+        format_hint = (
+            "Respond with ONLY the single instruction sentence (something like "
+            "'Write a short, warm WhatsApp message mentioning ... in a "
+            "friendly tone, under 60 words.'). No preamble, no quotes, no "
+            "markdown."
+        )
+
     return (
-        "You write a short INSTRUCTION for another AI to follow when it drafts "
-        "a WhatsApp outreach message — you do NOT write the message itself. "
-        "The instruction should tell that AI to write a short, warm WhatsApp "
-        "message that ties this specific lead's business to the stated goal, "
-        "grounded ONLY in the fit notes below. Do not invent or assume any "
-        "specific facts about the company beyond what's in the fit notes.\n\n"
+        f"You write a short INSTRUCTION for another AI to follow when it "
+        f"drafts {medium_desc} — you do NOT write the message itself. "
+        "The instruction should tell that AI to write a message that ties "
+        "this specific lead's business to the stated goal, grounded ONLY "
+        "in the fit notes below. Do not invent or assume any specific "
+        "facts about the company beyond what's in the fit notes.\n\n"
         f"Goal: {goal}\n"
         f"Company: {company}\n"
         f"Fit notes: {fit_notes or '(none provided)'}\n\n"
-        "Respond with ONLY the single instruction sentence (something like "
-        "'Write a short, warm WhatsApp message mentioning ... in a friendly "
-        "tone, under 30 words.'). No preamble, no quotes, no markdown."
+        f"{format_hint}"
     )
 
 
@@ -223,31 +211,32 @@ def _call_groq_once(prompt: str, company: str) -> str | None:
         return None
 
 
-def generate_context(lead: dict, goal: str) -> tuple[str, str]:
+def generate_context(lead: dict, goal: str, channel: str) -> tuple[str, str]:
     """
-    Three-tier fallback. Never raises — always returns a usable string, so
-    one bad lead never kills the run.
+    Three-tier fallback for a single channel ("whatsapp" or "email").
+    Never raises — always returns a usable string, so one bad lead never
+    kills the run.
 
     Returns (context_text, tier) where tier is one of
     "cerebras" / "groq" / "fallback", so the caller can report which tier
-    handled each lead.
+    handled each lead/channel.
     """
     company = lead.get("Company") or "this business"
     fit_notes = lead.get("Fit_Notes") or ""
-    prompt = _build_prompt(company, fit_notes, goal)
+    prompt = _build_prompt(company, fit_notes, goal, channel)
 
     text = _call_cerebras(prompt, company)
     if text:
         return text, "cerebras"
 
-    print(f"  [Cerebras] Exhausted for '{company}' — falling back to Groq...")
+    print(f"  [Cerebras] Exhausted for '{company}' ({channel}) — falling back to Groq...")
     time.sleep(random.uniform(*GROQ_DELAY_RANGE))
     text = _call_groq_once(prompt, company)
     if text:
         return text, "groq"
 
-    print(f"  [Groq fallback] Also failed for '{company}' — using generic fallback line.")
-    return build_fallback_line(goal), "fallback"
+    print(f"  [Groq fallback] Also failed for '{company}' ({channel}) — using generic fallback line.")
+    return build_fallback_line(goal, channel), "fallback"
 
 
 # ---------------- Change 3: filtering ----------------
@@ -291,43 +280,56 @@ def filter_leads(rows: list[dict]) -> tuple[list[dict], int, int]:
 # ---------------- Change 5: output ----------------
 def build_whatsapp_context_rows(eligible_leads: list[dict], goal: str) -> tuple[list[dict], dict]:
     """
-    For each eligible lead, generates a Context instruction and assembles
-    the output row. Also tallies which tier (cerebras / groq / fallback)
-    handled each lead, for the end-of-run summary.
+    For each eligible lead, generates BOTH a WhatsApp_Context instruction
+    and an Email_Context instruction (two separate tiered AI calls) and
+    assembles the output row. Also tallies which tier (cerebras / groq /
+    fallback) handled each channel call, for the end-of-run summary.
     """
     rows = []
-    tier_counts = {"cerebras": 0, "groq": 0, "fallback": 0}
+    tier_counts = {
+        "whatsapp": {"cerebras": 0, "groq": 0, "fallback": 0},
+        "email": {"cerebras": 0, "groq": 0, "fallback": 0},
+    }
     total = len(eligible_leads)
 
     for i, lead in enumerate(eligible_leads, start=1):
         company = lead.get("Company", "")
         print(f"[{i}/{total}] {company}")
 
-        context_text, tier = generate_context(lead, goal)
-        tier_counts[tier] += 1
+        whatsapp_text, whatsapp_tier = generate_context(lead, goal, "whatsapp")
+        tier_counts["whatsapp"][whatsapp_tier] += 1
+
+        # Spacing between the two per-lead channel calls — same reasoning
+        # as the spacing between leads below, keeps us under Cerebras's
+        # rate cap now that each lead makes two calls instead of one.
+        time.sleep(random.uniform(*CEREBRAS_DELAY_RANGE))
+
+        email_text, email_tier = generate_context(lead, goal, "email")
+        tier_counts["email"][email_tier] += 1
 
         rows.append({
-            "Name": lead.get("Number", ""),
-            "Context": context_text,
             "Company": company,
+            "WhatsApp_Context": whatsapp_text,
+            "Email_Context": email_text,
+            "Number": lead.get("Number", ""),
             "Email": lead.get("Email", ""),
         })
 
         # Light spacing between leads regardless of which tier handled the
-        # last one — keeps us comfortably under Cerebras's 30 RPM cap.
+        # last call — keeps us comfortably under Cerebras's rate cap.
         time.sleep(random.uniform(*CEREBRAS_DELAY_RANGE))
 
     return rows, tier_counts
 
 
-def save_whatsapp_context_csv(rows: list[dict]):
-    """Overwrites whatsapp_context.csv each run — same reasoning as the rest
-    of the pipeline: avoids re-messaging the same batch on a re-run."""
-    with open(WHATSAPP_CONTEXT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=WHATSAPP_CONTEXT_FIELDNAMES)
+def save_sender_csv(rows: list[dict]):
+    """Overwrites sender.csv each run — same reasoning as the rest of the
+    pipeline: avoids re-messaging the same batch on a re-run."""
+    with open(SENDER_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=SENDER_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
-    print(f"Wrote {len(rows)} rows to {WHATSAPP_CONTEXT_CSV}")
+    print(f"Wrote {len(rows)} rows to {SENDER_CSV}")
 
 
 # ---------------- Main ----------------
@@ -356,11 +358,14 @@ if __name__ == "__main__":
         else:
             print("\nGenerating personalized context...")
             context_rows, tier_counts = build_whatsapp_context_rows(eligible, goal_input)
-            save_whatsapp_context_csv(context_rows)
+            save_sender_csv(context_rows)
 
+            wa = tier_counts["whatsapp"]
+            em = tier_counts["email"]
             print(
-                f"\nDone. Processed {len(context_rows)} leads: "
-                f"{tier_counts['cerebras']} via Cerebras, "
-                f"{tier_counts['groq']} via Groq fallback, "
-                f"{tier_counts['fallback']} via generic fallback."
+                f"\nDone. Processed {len(context_rows)} leads (2 contexts each).\n"
+                f"  WhatsApp_Context: {wa['cerebras']} via Cerebras, "
+                f"{wa['groq']} via Groq fallback, {wa['fallback']} via generic fallback.\n"
+                f"  Email_Context:    {em['cerebras']} via Cerebras, "
+                f"{em['groq']} via Groq fallback, {em['fallback']} via generic fallback."
             )
