@@ -1,250 +1,519 @@
-import os
 import csv
+import os
+import re
 import time
 import random
-import urllib.parse
+from datetime import date
+from urllib.parse import urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup
+import googlemaps
+from dotenv import load_dotenv
+import phonenumbers
+
+try:
+    from serpapi import GoogleSearch
+except ImportError:
+    GoogleSearch = None
+
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    DDGS = None
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
-from dotenv import load_dotenv
-
-from ai_provider import generate_text, provider_summary
-
 load_dotenv()
 
+# ---------------- Config ----------------
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+SERP_API_KEY = os.getenv("SERP_API_KEY")
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-CSV_FILE = r"C:\Users\hp\OneDrive\Desktop\DESKTOP\Programming\Python\Sales Automation\data\sender.csv"
-
-FALLBACK_MESSAGE = None
-HARDCODED_FALLBACK_MESSAGE = (
-    "Hi! Just reaching out to connect — would love to chat if you're open to it."
-)
-
-# Profile lives OUTSIDE OneDrive (OneDrive sync can lock/corrupt Chrome profile
-# files, which stops WhatsApp Web from loading its QR code). Lead_Generator.py
-# should use this same path so both scripts share one WhatsApp login.
-PROFILE_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
-    "whatsapp_selenium_profile",
-)
-LOGIN_TIMEOUT = 180
-CHAT_LOAD_TIMEOUT = 30
-
-# Chat list present => logged in. Canvas / data-ref => QR code is showing.
-LOGGED_IN_XPATH = (
-    '//div[@id="pane-side"] | //div[@id="side"] | //div[@aria-label="Chat list"]'
-)
-QR_XPATH = '//canvas | //div[@data-ref]'
-COMPOSE_XPATH = (
-    '//footer//div[@contenteditable="true"] | '
-    '//div[@contenteditable="true"][@data-tab="10"]'
-)
-
-
-# ---------------------------------------------------------------------------
-# CSV loading
-# ---------------------------------------------------------------------------
-
-def load_contacts(csv_path: str) -> list[dict]:
-    """Read sender.csv and return list of {"phone": ..., "prompt": ...} dicts"""
-    contacts = []
-
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Could not find '{csv_path}'.")
-
-    with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for i, row in enumerate(reader, start=2):
-            phone = (row.get("Number") or "").strip()
-            prompt = (row.get("WhatsApp_Context") or "").strip()
-
-            if not phone:
-                print(f"Warning: row {i} has no phone number, skipping.")
-                continue
-
-            if not prompt:
-                prompt = "Write a short, friendly WhatsApp message under 30 words."
-
-            contacts.append({"phone": phone, "prompt": prompt})
-
-    return contacts
-
-
-# ---------------------------------------------------------------------------
-# AI message generation
-# ---------------------------------------------------------------------------
-
-def generate_fallback_message(instruction: str) -> str:
-    """Generate a fallback message (Groq first, Google Gemini second)."""
-    full_prompt = (
-        f"{instruction}. Write this as a single finished WhatsApp message, "
-        f"under 30 words, ready to send as-is."
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     )
+}
+REQUEST_TIMEOUT = 10
+DELAY_RANGE = (2, 4)       # between API calls
 
-    text, _provider = generate_text(full_prompt)
-    if text:
-        return text
+MAX_RESULTS_PER_KEYWORD = 5  # bumped up from prototype.py's 3
 
-    print("Using hardcoded fallback message.")
-    return HARDCODED_FALLBACK_MESSAGE
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+MASTER_LEADS_CSV = os.path.join(DATA_DIR, "leads_master.csv")
+COMPANY_PROFILE_CSV = os.path.join(DATA_DIR, "company_profile.csv")
+
+# Same folder whatapp_sender.py points its persistent Chrome profile at, so
+# the WhatsApp Web login session (and QR-code scan) is shared between the
+# two scripts regardless of which one is run from where.
+PROFILE_DIR = os.path.join(os.getcwd(), "whatsapp_selenium_profile")
+
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+PHONE_RE = re.compile(r"(?:\+?\d[\d\-.\s()]{6,16}\d)")
+CONTACT_PAGE_HINTS = ["contact", "about", "get-in-touch", "reach-us"]
+
+LEAD_FIELDNAMES = [
+    "company_name", "phone", "phone_clean", "website", "email",
+    "address", "keyword", "date_found",
+]
+
+def _digit_count(s: str) -> int:
+    return sum(c.isdigit() for c in s)
 
 
-def get_ai_message(prompt: str) -> str | None:
-    """Generate a personalized message: Groq first, Google Gemini second."""
-    variation_hint = random.choice([
-        "Make it upbeat.",
-        "Make it warm and casual.",
-        "Make it playful.",
-        "Keep it simple and sincere.",
-    ])
-    full_prompt = f"{prompt}. Keep it under 30 words, suitable for WhatsApp. {variation_hint}"
+# ---------------- Phone parsing helpers (Change 2) ----------------
+# Address-based region guessing (Maps' formatted_address -> country ->
+# ISO region) was producing wrong E.164 numbers for a chunk of leads,
+# which in turn made WhatsApp verification land on "Unverified" instead
+# of correctly detecting a valid number. Simpler and more reliable: the
+# user manually enters the country dial code once per run (all leads in
+# a run share one location/search anyway), and every number is parsed
+# against that.
+def normalize_country_code(raw: str) -> str | None:
+    """
+    Normalizes a user-entered country dial code like '+91', '91', or
+    ' +91 ' into the '+91' shape phonenumbers expects. Returns None if it
+    doesn't look like a valid dial code.
+    """
+    if not raw:
+        return None
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return None
+    return f"+{digits}"
 
-    text, _provider = generate_text(full_prompt)
-    return text
+
+def clean_phone(raw: str, country_code: str | None = None) -> str:
+    """
+    Normalize a phone number into E.164 ('+<countrycode><number>') using
+    the phonenumbers library.
+    - If raw already starts with '+', parse it as-is (it's self-describing).
+    - Otherwise, strip non-digits, drop a single leading trunk '0' (common
+      domestic-format leading zero), and prepend the user-supplied
+      country_code (e.g. '+91') before parsing.
+    Returns '' if nothing validates.
+    """
+    if not raw:
+        return ""
+
+    def _validate(candidate: str) -> str | None:
+        try:
+            parsed = phonenumbers.parse(candidate, None)
+        except phonenumbers.NumberParseException:
+            return None
+        if phonenumbers.is_valid_number(parsed):
+            return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+        return None
+
+    raw = raw.strip()
+    if raw.startswith("+"):
+        result = _validate(raw)
+        if result:
+            return result
+        # Fall through in case it's malformed (e.g. stray characters) but
+        # otherwise usable once we strip it down and re-add the dial code.
+
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return ""
+    if digits.startswith("0"):
+        digits = digits[1:]
+
+    if country_code:
+        result = _validate(f"{country_code}{digits}")
+        if result:
+            return result
+
+    return ""
 
 
-# ---------------------------------------------------------------------------
-# Selenium / WhatsApp Web logic
-# ---------------------------------------------------------------------------
+# ---------------- Source 1: Google Maps ----------------
+def search_google_maps(keyword: str, location: str, country_code: str,
+                        max_results: int = MAX_RESULTS_PER_KEYWORD) -> list[dict]:
+    if not GOOGLE_MAPS_API_KEY:
+        print("  [Maps] Skipped — no GOOGLE_MAPS_API_KEY set in .env")
+        return []
 
-def build_driver() -> webdriver.Chrome:
-    """Launch Chrome with a persistent profile, hiding obvious automation flags
-    (WhatsApp Web can refuse to render the QR code for automated browsers)."""
-    os.makedirs(PROFILE_DIR, exist_ok=True)
+    gmaps = googlemaps.Client(key=GOOGLE_MAPS_API_KEY)
+    results = []
+    try:
+        response = gmaps.places(query=f"{keyword} in {location}")
+        for place in response.get("results", [])[:max_results]:
+            place_id = place.get("place_id")
+            details = {}
+            if place_id:
+                details = gmaps.place(
+                    place_id=place_id,
+                    fields=["name", "formatted_address", "formatted_phone_number", "website"],
+                ).get("result", {})
+            phone_raw = details.get("formatted_phone_number", "")
+            address = details.get("formatted_address", place.get("formatted_address", ""))
+
+            results.append({
+                "company_name": details.get("name", place.get("name", "")),
+                "website": details.get("website", ""),
+                "email": "",
+                "phone": phone_raw,
+                "phone_clean": clean_phone(phone_raw, country_code=country_code),
+                "address": address,
+                "keyword": keyword,
+                "date_found": date.today().isoformat(),
+            })
+            time.sleep(random.uniform(*DELAY_RANGE))
+    except Exception as e:
+        print(f"  [Maps] Error: {e}")
+    return results
+
+
+# ---------------- Source 2: Web Search (SerpAPI / DuckDuckGo) ----------------
+# NEW APPROACH: Enrich existing Maps leads by searching for company name + location
+# (Instead of discovering new leads, we verify and enrich the ones we already have)
+def enrich_with_web_search(leads: list[dict], location: str, country_code: str) -> list[dict]:
+    """
+    For each lead already found in Google Maps, search the web for the company name
+    to find additional contact info (email, phone) that Maps may have missed.
+    Uses SerpAPI (primary) or DuckDuckGo (fallback).
+    
+    This ENRICHES existing leads rather than discovering new ones.
+    """
+    if not leads:
+        return leads
+
+    for lead in leads:
+        company_name = lead.get("company_name", "")
+        if not company_name:
+            continue
+
+        # Search for this specific company to find additional contact info
+        search_query = f"{company_name} {location}"
+
+        # Try SerpAPI first
+        if SERP_API_KEY and GoogleSearch:
+            try:
+                search = GoogleSearch({
+                    "q": search_query,
+                    "api_key": SERP_API_KEY,
+                    "num": 1,  # Just need top result for verification
+                })
+                data = search.get_dict()
+                result = data.get("organic_results", [{}])[0]
+                snippet = result.get("snippet", "")
+
+                # Extract email and phone from snippet if not already in lead
+                if snippet:
+                    if not lead.get("email"):
+                        email_match = EMAIL_RE.search(snippet)
+                        if email_match:
+                            lead["email"] = email_match.group(0)
+                    if not lead.get("phone") and not lead.get("phone_clean"):
+                        phone_match = PHONE_RE.search(snippet)
+                        if phone_match:
+                            phone_raw = phone_match.group(0)
+                            lead["phone"] = phone_raw
+                            lead["phone_clean"] = clean_phone(phone_raw, country_code=country_code)
+
+                time.sleep(random.uniform(*DELAY_RANGE))
+                continue  # Move to next lead
+            except Exception as e:
+                pass  # Silently continue, not critical for enrichment
+
+        # Fallback to DuckDuckGo
+        if DDGS:
+            try:
+                with DDGS() as ddgs:
+                    search_results = list(ddgs.text(search_query, max_results=1))
+                    if search_results:
+                        result = search_results[0]
+                        snippet = result.get("body", "")
+
+                        # Extract email and phone from snippet if not already in lead
+                        if snippet:
+                            if not lead.get("email"):
+                                email_match = EMAIL_RE.search(snippet)
+                                if email_match:
+                                    lead["email"] = email_match.group(0)
+                            if not lead.get("phone") and not lead.get("phone_clean"):
+                                phone_match = PHONE_RE.search(snippet)
+                                if phone_match:
+                                    phone_raw = phone_match.group(0)
+                                    lead["phone"] = phone_raw
+                                    lead["phone_clean"] = clean_phone(phone_raw, country_code=country_code)
+
+                        time.sleep(random.uniform(*DELAY_RANGE))
+            except Exception as e:
+                pass  # Silently continue, not critical for enrichment
+
+    return leads
+
+
+# ---------------- Source 3: Company website scraping ----------------
+def fetch_page(url: str):
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        return BeautifulSoup(resp.text, "lxml")
+    except requests.RequestException:
+        return None
+
+
+def find_contact_page(base_url: str, soup: BeautifulSoup):
+    for a in soup.find_all("a", href=True):
+        href = a["href"].lower()
+        if any(hint in href for hint in CONTACT_PAGE_HINTS):
+            return urljoin(base_url, a["href"])
+    return None
+
+
+def scrape_email_from_site(url: str) -> str:
+    soup = fetch_page(url)
+    if soup is None:
+        return ""
+
+    page_text = soup.get_text(" ", strip=True)
+    emails = set(EMAIL_RE.findall(page_text))
+
+    contact_url = find_contact_page(url, soup)
+    if contact_url and not emails:
+        time.sleep(random.uniform(*DELAY_RANGE))
+        contact_soup = fetch_page(contact_url)
+        if contact_soup:
+            contact_text = contact_soup.get_text(" ", strip=True)
+            emails |= set(EMAIL_RE.findall(contact_text))
+
+    return next(iter(emails), "")
+
+
+def enrich_leads_with_email(leads: list[dict]) -> int:
+    """Scrapes each lead's website (found via Maps) for an email, in place."""
+    enriched_count = 0
+    for lead in leads:
+        website = lead.get("website")
+        if not website:
+            continue
+        email = scrape_email_from_site(website)
+        if email:
+            lead["email"] = email
+            enriched_count += 1
+        time.sleep(random.uniform(*DELAY_RANGE))
+    return enriched_count
+
+
+# ---------------- Source 3: Groq vertical-fit check (Change 3) ----------------
+
+
+# ---------------- Source 3: WhatsApp verification via Selenium ----------------
+def build_driver():
+    """
+    Builds a Chrome WebDriver pointed at the same persistent profile
+    directory whatapp_sender.py uses, so a previously scanned WhatsApp Web
+    QR-code session carries over — no second scan needed.
+    """
     options = Options()
     options.add_argument(f"--user-data-dir={PROFILE_DIR}")
     options.add_argument("--profile-directory=Default")
-    options.add_argument("--window-size=1200,900")
-    options.add_argument("--lang=en-US")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--disable-popup-blocking")
-    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
-    options.add_experimental_option("useAutomationExtension", False)
-    try:
-        return webdriver.Chrome(options=options)
-    except Exception as error:
-        print(f"Could not start Chrome: {error}")
-        print("Close ALL Chrome windows opened by these scripts (check Task Manager "
-              "for stray chrome.exe / chromedriver.exe) and try again.")
-        raise
-
-
-def wait_for_login(driver: webdriver.Chrome) -> None:
-    """Wait for WhatsApp Web login, reporting what the page is actually showing."""
+    options.add_argument("--start-maximized")
+    driver = webdriver.Chrome(options=options)
     driver.get("https://web.whatsapp.com")
-    print("Waiting for WhatsApp Web to load...")
+    return driver
 
-    start = time.time()
-    qr_announced = False
-    refreshed = False
 
-    while time.time() - start < LOGIN_TIMEOUT:
-        if driver.find_elements(By.XPATH, LOGGED_IN_XPATH):
-            print("Logged in to WhatsApp Web.")
-            time.sleep(2)
-            return
-
-        if driver.find_elements(By.XPATH, QR_XPATH) and not qr_announced:
-            print(">>> QR code is showing. Scan it with your phone: "
-                  "WhatsApp > Settings > Linked devices > Link a device.")
-            qr_announced = True
-
-        # Page stuck blank for 40s with nothing recognisable: refresh once.
-        if not qr_announced and not refreshed and time.time() - start > 40:
-            print("Page looks blank/stuck, refreshing once...")
-            driver.refresh()
-            refreshed = True
-
-        time.sleep(1)
-
-    # Timed out: save evidence so we can see what WhatsApp actually displayed.
+def wait_for_login(driver, timeout: int = 60) -> bool:
+    """Blocks until WhatsApp Web's main chat list has loaded (i.e. we're logged in)."""
     try:
-        driver.save_screenshot("whatsapp_debug.png")
-        print(f"Page title: {driver.title!r}")
-        print("Saved screenshot to whatsapp_debug.png in the current folder.")
-    except Exception:
-        pass
-    raise TimeoutException("WhatsApp Web did not reach the chat list in time.")
-
-
-def send_whatsapp_message(driver: webdriver.Chrome, phone: str, message: str) -> bool:
-    """Send WhatsApp message"""
-    phone_clean = phone.replace("+", "").replace(" ", "").replace("-", "")
-    encoded_message = urllib.parse.quote(message)
-    url = f"https://web.whatsapp.com/send?phone={phone_clean}&text={encoded_message}"
-
-    driver.get(url)
-
-    try:
-        compose_box = WebDriverWait(driver, CHAT_LOAD_TIMEOUT).until(
-            EC.presence_of_element_located(
-                (By.XPATH, COMPOSE_XPATH)
-            )
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.XPATH, "//div[@id='pane-side']"))
         )
+        return True
     except TimeoutException:
-        print(f"Could not load chat for {phone}. Skipping.")
+        print("  [WhatsApp] Timed out waiting for login — scan the QR code if prompted.")
         return False
 
-    time.sleep(2)
-    compose_box.send_keys(Keys.ENTER)
-    time.sleep(3)
-    return True
+
+def check_whatsapp_number(driver, phone_clean: str, timeout: int = 20) -> str:
+    """
+    Navigates to web.whatsapp.com/send?phone=<digits> and inspects the
+    result:
+      - compose box loads within timeout -> "Yes"
+      - WhatsApp's "invalid phone number" dialog appears -> "No"
+      - neither happens within timeout -> "Unverified" (logged, not fatal)
+    Does NOT send a message or press Enter — read-only check.
+    """
+    if not phone_clean:
+        return "Unverified"
+
+    digits = re.sub(r"[+\s\-]", "", phone_clean)
+    url = f"https://web.whatsapp.com/send?phone={digits}"
+
+    try:
+        driver.get(url)
+    except Exception as e:
+        print(f"  [WhatsApp] Navigation failed for {phone_clean}: {e}")
+        return "Unverified"
+
+    # Happy path: the message compose box loads -> valid WhatsApp number.
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//div[@contenteditable='true'][@data-tab]")
+            )
+        )
+        return "Yes"
+    except TimeoutException:
+        pass
+
+    # Invalid-number path: WhatsApp shows a dialog to that effect.
+    # NOTE: this XPath is based on WhatsApp Web's known wording as of this
+    # writing and may need adjusting against a live run if WhatsApp changes
+    # the dialog's text/markup — treat a mismatch here as expected, not a
+    # sign the surrounding logic is wrong.
+    try:
+        WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//*[contains(text(), 'Phone number shared via url is invalid')]")
+            )
+        )
+        return "No"
+    except TimeoutException:
+        print(f"  [WhatsApp] Couldn't confirm valid/invalid for {phone_clean} — marking Unverified")
+        return "Unverified"
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ---------------- CSV output ----------------
+def save_master_leads(leads: list[dict]):
+    write_header = not os.path.exists(MASTER_LEADS_CSV)
+    with open(MASTER_LEADS_CSV, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=LEAD_FIELDNAMES)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(leads)
+    print(f"\nAppended {len(leads)} leads to {MASTER_LEADS_CSV}")
+
+
+def build_company_profile_rows(leads: list[dict], driver) -> list[dict]:
+    """
+    For every lead with a usable phone_clean, runs WhatsApp verification
+    and includes ALL of them in the output (verified or not) — filtering is
+    a decision for context.py / the user downstream, not this stage.
+    """
+    rows = []
+    phoned_leads = [l for l in leads if l.get("phone_clean")]
+    total = len(phoned_leads)
+
+    for i, lead in enumerate(phoned_leads, start=1):
+        company = lead.get("company_name", "")
+        print(f"  [{i}/{total}] {company}")
+
+        print("    -> WhatsApp verification...")
+        whatsapp_verified = check_whatsapp_number(driver, lead["phone_clean"])
+
+        rows.append({
+            "Company": company,
+            "Website": lead.get("website", ""),
+            "Email": lead.get("email", ""),
+            "Number": lead["phone_clean"],
+            "WhatsApp_Verified": whatsapp_verified,
+        })
+
+    return rows
+
+
+def save_company_profile_csv(rows: list[dict]):
+    """Overwrites company_profile.csv each run — avoids re-messaging the
+    same batch on a re-run (same reasoning the old save_context_csv() used)."""
+    fieldnames = ["Company", "Website", "Email", "Number", "WhatsApp_Verified"]
+    with open(COMPANY_PROFILE_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Wrote {len(rows)} rows to {COMPANY_PROFILE_CSV} (ready for context.py)")
+
+
+# ---------------- Main ----------------
+def dedupe_leads(leads: list[dict]) -> list[dict]:
+    """Drop duplicate leads (same phone, or same website if no phone) that
+    can occur when overlapping keywords return the same business twice."""
+    seen = set()
+    unique = []
+    for lead in leads:
+        key = lead.get("phone_clean") or lead.get("website") or lead.get("company_name")
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(lead)
+    return unique
+
+
+def run_pipeline(keywords: list[str], location: str, goal: str, country_code: str,
+                  max_per_keyword: int = MAX_RESULTS_PER_KEYWORD):
+    all_leads = []
+
+    for idx, keyword in enumerate(keywords, start=1):
+        print(f"\n[{idx}/{len(keywords)}] Keyword: '{keyword}'")
+
+        print("  [1/2] Google Maps...")
+        maps_leads = search_google_maps(keyword, location, country_code, max_results=max_per_keyword)
+        print(f"    -> {len(maps_leads)} leads")
+
+        print("  [2/2] Enriching leads (scraping websites + web search)...")
+        # First scrape websites for emails
+        email_count = enrich_leads_with_email(maps_leads)
+        print(f"    -> {email_count} leads got an email added")
+        
+        # Then enrich with web search for additional contact info
+        enrich_with_web_search(maps_leads, location, country_code)
+        print(f"    -> Web search completed for enrichment")
+
+        all_leads.extend(maps_leads)
+
+    all_leads = dedupe_leads(all_leads)
+    print(f"\nTotal unique leads across all keywords: {len(all_leads)}")
+
+    save_master_leads(all_leads)
+
+    print("\nVerifying WhatsApp numbers...")
+    driver = None
+    profile_rows = []
+    try:
+        driver = build_driver()
+        wait_for_login(driver)
+        profile_rows = build_company_profile_rows(all_leads, driver)
+    finally:
+        if driver is not None:
+            driver.quit()
+
+    save_company_profile_csv(profile_rows)
+
+    no_phone = len(all_leads) - len(profile_rows)
+    if no_phone:
+        print(f"Note: {no_phone} lead(s) had no usable phone number and were left out of "
+              f"company_profile.csv (they're still in {os.path.basename(MASTER_LEADS_CSV)}).")
+
+    return all_leads, profile_rows
+
 
 if __name__ == "__main__":
-    print(f"AI setup: {provider_summary()}\n")
+    print("=== Lead Gen -> WhatsApp Company Profile Pipeline ===\n")
 
-    fallback_instruction = input(
-        "Briefly describe the fallback message to use if personalization fails "
-        "(e.g., 'a friendly generic intro mentioning I sell pens'): "
-    ).strip()
+    location_input = input("Enter location (e.g. 'Andheri, Mumbai'): ").strip()
+    keywords_input = input("Enter keywords, comma-separated (e.g. 'digital marketing agency, interior designer'): ").strip()
+    country_code_input = input("Enter the country dial code for these leads' phone numbers "
+                                "(e.g. '+91' for India, '+51' for Peru): ").strip()
 
-    if not fallback_instruction:
-        fallback_instruction = "a short, warm, generic WhatsApp introduction message"
+    keyword_list = [k.strip() for k in keywords_input.split(",") if k.strip()]
+    country_code = normalize_country_code(country_code_input)
 
-    FALLBACK_MESSAGE = generate_fallback_message(fallback_instruction)
-    print(f"Fallback message ready: {FALLBACK_MESSAGE}\n")
-
-    contacts = load_contacts(CSV_FILE)
-
-    if not contacts:
-        print("No valid contacts found in CSV. Nothing to send.")
+    if not location_input or not keyword_list:
+        print("Location and at least one keyword are required. Exiting.")
+    elif not country_code:
+        print(f"'{country_code_input}' doesn't look like a valid country dial code "
+              f"(e.g. '+91'). Exiting.")
     else:
-        driver = build_driver()
-        try:
-            wait_for_login(driver)
-
-            for i, contact in enumerate(contacts, start=1):
-                phone = contact["phone"]
-                prompt = contact["prompt"]
-
-                print(f"[{phone}] ({i}/{len(contacts)}) Generating message...")
-                message = get_ai_message(prompt)
-
-                if message is None:
-                    message = FALLBACK_MESSAGE
-                    print(f"[{phone}] AI generation failed — using fallback message.")
-
-                print(f"[{phone}] Generated: {message}")
-
-                sent = send_whatsapp_message(driver, phone, message)
-                print(f"[{phone}] {'✓ Sent' if sent else '✗ FAILED'}\n")
-
-            print("Done!")
-        finally:
-            time.sleep(3)
-            driver.quit()
+        run_pipeline(keyword_list, location_input, "", country_code)
