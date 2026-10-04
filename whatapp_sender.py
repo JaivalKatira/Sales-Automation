@@ -1,3 +1,36 @@
+"""
+WhatsApp bulk sender with AI-generated messages (Groq primary, Google Gemini fallback),
+using Selenium for a single persistent WhatsApp Web session
+(no repeated tab-opening, no repeated QR scans after the first run).
+
+Requirements:
+    pip install selenium openai python-dotenv
+    (also needs ai_provider.py in this same folder)
+
+Setup:
+    Set your API keys in a .env file in this same folder:
+        GROQ_API_KEY=your-groq-key-here              (primary)
+        GOOGLE_API_KEY=your-google-gemini-key-here   (fallback)
+
+    Models default to openai/gpt-oss-120b (Groq) and gemini-3.5-flash-lite
+    (Google); see ai_provider.py to override them.
+
+    Get free keys at:
+        - Groq: console.groq.com
+        - Google Gemini: aistudio.google.com
+
+    First run: a Chrome window opens to WhatsApp Web and shows a QR code.
+    Scan it once with your phone. Your login session is saved to the
+    'whatsapp_selenium_profile' folder, so future runs won't ask for QR code.
+
+CSV format (sender.csv, produced by context.py):
+    Company,WhatsApp_Context,Email_Context,Number,Email
+    Acme Co,"Write a short, warm 'Hi' message...",...,+919819042429,acme@example.com
+    Beta Inc,"Write a short, warm 'Hi' message...",...,+919323096918,beta@example.com
+
+This script only reads the `Number` and `WhatsApp_Context` columns.
+"""
+
 import os
 import csv
 import time
@@ -12,12 +45,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
-from openai import OpenAI
 from dotenv import load_dotenv
 
-# Load variables from a .env file (in the same folder as this script) into
-# the environment, so NVIDIA_API_KEY etc. don't need to be set manually in
-# every terminal session.
+from ai_provider import generate_text, provider_summary
+
 load_dotenv()
 
 
@@ -27,43 +58,30 @@ load_dotenv()
 
 CSV_FILE = r"C:\Users\hp\OneDrive\Desktop\DESKTOP\Programming\Python\Sales Automation\data\sender.csv"
 
-# TEMPORARY: swapped to Groq to test whether NIM itself is the bottleneck.
-# Swap back to the NVIDIA NIM block below once confirmed.
-nim_client = OpenAI(
-    api_key=os.environ.get("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1",
-    timeout=30.0,   # seconds — fail fast on a slow/stalled connection instead of hanging
-    max_retries=1,  # one retry on transient errors, then give up
-)
-NIM_MODEL = os.environ.get("NIM_MODEL", "llama-3.3-70b-versatile")
-
-# --- Original NVIDIA NIM config (commented out for now) ---
-# nim_client = OpenAI(
-#     api_key=os.environ.get("NVIDIA_API_KEY"),
-#     base_url="https://integrate.api.nvidia.com/v1",
-#     timeout=30.0,
-#     max_retries=1,
-# )
-# NIM_MODEL = os.environ.get("NIM_MODEL", "meta/llama-3.3-70b-instruct")
-
-# Generated once, before the sending loop starts, by generate_fallback_message().
-# Used per-contact whenever get_ai_message() fails for that contact.
 FALLBACK_MESSAGE = None
-
-# Hardcoded literal used only if generate_fallback_message() itself fails
-# (e.g. NIM is down at startup). Never let that failure block the script
-# from starting.
 HARDCODED_FALLBACK_MESSAGE = (
     "Hi! Just reaching out to connect — would love to chat if you're open to it."
 )
 
-# Folder where the browser session (login) is saved, so you only scan the
-# WhatsApp QR code once, not on every run.
-PROFILE_DIR = os.path.join(os.getcwd(), "whatsapp_selenium_profile")
-
-# How long to wait (seconds) for WhatsApp Web to log in / load a chat
-LOGIN_TIMEOUT = 90
+# Profile lives OUTSIDE OneDrive (OneDrive sync can lock/corrupt Chrome profile
+# files, which stops WhatsApp Web from loading its QR code). Lead_Generator.py
+# should use this same path so both scripts share one WhatsApp login.
+PROFILE_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+    "whatsapp_selenium_profile",
+)
+LOGIN_TIMEOUT = 180
 CHAT_LOAD_TIMEOUT = 30
+
+# Chat list present => logged in. Canvas / data-ref => QR code is showing.
+LOGGED_IN_XPATH = (
+    '//div[@id="pane-side"] | //div[@id="side"] | //div[@aria-label="Chat list"]'
+)
+QR_XPATH = '//canvas | //div[@data-ref]'
+COMPOSE_XPATH = (
+    '//footer//div[@contenteditable="true"] | '
+    '//div[@contenteditable="true"][@data-tab="10"]'
+)
 
 
 # ---------------------------------------------------------------------------
@@ -71,17 +89,11 @@ CHAT_LOAD_TIMEOUT = 30
 # ---------------------------------------------------------------------------
 
 def load_contacts(csv_path: str) -> list[dict]:
-    """Read sender.csv (produced by context.py) and return a list of
-    {"phone": ..., "prompt": ...} dicts, pulling the phone number from
-    `Number` and the outreach instruction from `WhatsApp_Context`.
-    `Email_Context` and `Email` columns, if present, are ignored here —
-    they're for a separate email sender."""
+    """Read sender.csv and return list of {"phone": ..., "prompt": ...} dicts"""
     contacts = []
 
     if not os.path.exists(csv_path):
-        raise FileNotFoundError(
-            f"Could not find '{csv_path}'. Make sure it's in the same folder as this script."
-        )
+        raise FileNotFoundError(f"Could not find '{csv_path}'.")
 
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -94,7 +106,6 @@ def load_contacts(csv_path: str) -> list[dict]:
                 continue
 
             if not prompt:
-                print(f"Warning: row {i} ({phone}) has no context/prompt, using a generic message.")
                 prompt = "Write a short, friendly WhatsApp message under 30 words."
 
             contacts.append({"phone": phone, "prompt": prompt})
@@ -107,85 +118,32 @@ def load_contacts(csv_path: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def generate_fallback_message(instruction: str) -> str:
-    """
-    One-time call (not per-contact) to the NIM client used for personalization.
-    Unlike the per-contact Context prompts used elsewhere in this pipeline,
-    this one asks for a finished, ready-to-send message -- this is the last
-    tier, nothing downstream rewrites it.
+    """Generate a fallback message (Groq first, Google Gemini second)."""
+    full_prompt = (
+        f"{instruction}. Write this as a single finished WhatsApp message, "
+        f"under 30 words, ready to send as-is."
+    )
 
-    On failure (API error, empty response), falls back to a hardcoded literal
-    string so the run can still start. Never let a failure here block the
-    script from starting.
-    """
-    api_key = os.environ.get("GROQ_API_KEY")  # TEMPORARY: testing with Groq
-    if not api_key:
-        print("Warning: GROQ_API_KEY environment variable not set. Using hardcoded fallback message.")
-        return HARDCODED_FALLBACK_MESSAGE
-
-    try:
-        full_prompt = (
-            f"{instruction}. Write this as a single finished WhatsApp message, "
-            f"under 30 words, ready to send as-is."
-        )
-
-        response = nim_client.chat.completions.create(
-            model=NIM_MODEL,
-            messages=[{"role": "user", "content": full_prompt}],
-        )
-
-        text = (response.choices[0].message.content or "").strip()
-        if not text:
-            print("NIM returned an empty response for the fallback message. Using hardcoded fallback message.")
-            return HARDCODED_FALLBACK_MESSAGE
-
-        text = text.strip('"').strip("'").strip()
+    text, _provider = generate_text(full_prompt)
+    if text:
         return text
 
-    except Exception as error:
-        print(f"NIM API request failed while generating the fallback message: {error}")
-        print("Using hardcoded fallback message.")
-        return HARDCODED_FALLBACK_MESSAGE
+    print("Using hardcoded fallback message.")
+    return HARDCODED_FALLBACK_MESSAGE
 
 
 def get_ai_message(prompt: str) -> str | None:
-    """
-    Generate a short WhatsApp-friendly message using NVIDIA NIM.
+    """Generate a personalized message: Groq first, Google Gemini second."""
+    variation_hint = random.choice([
+        "Make it upbeat.",
+        "Make it warm and casual.",
+        "Make it playful.",
+        "Keep it simple and sincere.",
+    ])
+    full_prompt = f"{prompt}. Keep it under 30 words, suitable for WhatsApp. {variation_hint}"
 
-    Returns the generated text, or None if the API call fails for any
-    reason. When this returns None, the caller should use FALLBACK_MESSAGE
-    (generated once, up front, by generate_fallback_message()) rather than
-    skipping the contact or calling the AI again.
-    """
-    api_key = os.environ.get("GROQ_API_KEY")  # TEMPORARY: testing with Groq
-    if not api_key:
-        print("Warning: GROQ_API_KEY environment variable not set.")
-        return None
-
-    try:
-        variation_hint = random.choice([
-            "Make it upbeat.",
-            "Make it warm and casual.",
-            "Make it playful.",
-            "Keep it simple and sincere.",
-        ])
-        full_prompt = f"{prompt}. Keep it under 30 words, suitable for WhatsApp. {variation_hint}"
-
-        response = nim_client.chat.completions.create(
-            model=NIM_MODEL,
-            messages=[{"role": "user", "content": full_prompt}],
-        )
-
-        text = (response.choices[0].message.content or "").strip()
-        if not text:
-            print("NIM returned an empty response.")
-            return None
-
-        text = text.strip('"').strip("'").strip()
-        return text
-
-    except Exception as error:
-        print(f"NIM API request failed: {error}")
-        return None
+    text, _provider = generate_text(full_prompt)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -193,35 +151,67 @@ def get_ai_message(prompt: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def build_driver() -> webdriver.Chrome:
-    """Launch Chrome with a persistent profile so the login session is reused."""
+    """Launch Chrome with a persistent profile, hiding obvious automation flags
+    (WhatsApp Web can refuse to render the QR code for automated browsers)."""
+    os.makedirs(PROFILE_DIR, exist_ok=True)
     options = Options()
     options.add_argument(f"--user-data-dir={PROFILE_DIR}")
     options.add_argument("--profile-directory=Default")
-    # Keeps the window reasonably sized and visible so you can scan the QR code
     options.add_argument("--window-size=1200,900")
-
-    driver = webdriver.Chrome(options=options)
-    return driver
+    options.add_argument("--lang=en-US")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-popup-blocking")
+    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    options.add_experimental_option("useAutomationExtension", False)
+    try:
+        return webdriver.Chrome(options=options)
+    except Exception as error:
+        print(f"Could not start Chrome: {error}")
+        print("Close ALL Chrome windows opened by these scripts (check Task Manager "
+              "for stray chrome.exe / chromedriver.exe) and try again.")
+        raise
 
 
 def wait_for_login(driver: webdriver.Chrome) -> None:
-    """Open WhatsApp Web and wait until the chat list is visible (i.e. logged in)."""
+    """Wait for WhatsApp Web login, reporting what the page is actually showing."""
     driver.get("https://web.whatsapp.com")
+    print("Waiting for WhatsApp Web to load...")
 
-    print("Waiting for WhatsApp Web to load. If a QR code appears, scan it now...")
-    WebDriverWait(driver, LOGIN_TIMEOUT).until(
-        EC.presence_of_element_located((By.XPATH, '//div[@id="side"]'))
-    )
-    print("Logged in to WhatsApp Web.")
+    start = time.time()
+    qr_announced = False
+    refreshed = False
+
+    while time.time() - start < LOGIN_TIMEOUT:
+        if driver.find_elements(By.XPATH, LOGGED_IN_XPATH):
+            print("Logged in to WhatsApp Web.")
+            time.sleep(2)
+            return
+
+        if driver.find_elements(By.XPATH, QR_XPATH) and not qr_announced:
+            print(">>> QR code is showing. Scan it with your phone: "
+                  "WhatsApp > Settings > Linked devices > Link a device.")
+            qr_announced = True
+
+        # Page stuck blank for 40s with nothing recognisable: refresh once.
+        if not qr_announced and not refreshed and time.time() - start > 40:
+            print("Page looks blank/stuck, refreshing once...")
+            driver.refresh()
+            refreshed = True
+
+        time.sleep(1)
+
+    # Timed out: save evidence so we can see what WhatsApp actually displayed.
+    try:
+        driver.save_screenshot("whatsapp_debug.png")
+        print(f"Page title: {driver.title!r}")
+        print("Saved screenshot to whatsapp_debug.png in the current folder.")
+    except Exception:
+        pass
+    raise TimeoutException("WhatsApp Web did not reach the chat list in time.")
 
 
 def send_whatsapp_message(driver: webdriver.Chrome, phone: str, message: str) -> bool:
-    """
-    Navigate to a chat with the given phone number (pre-filled with `message`)
-    in the SAME browser tab, and send it by pressing Enter.
-
-    Returns True if the message appeared to send, False otherwise.
-    """
+    """Send WhatsApp message"""
     phone_clean = phone.replace("+", "").replace(" ", "").replace("-", "")
     encoded_message = urllib.parse.quote(message)
     url = f"https://web.whatsapp.com/send?phone={phone_clean}&text={encoded_message}"
@@ -229,22 +219,17 @@ def send_whatsapp_message(driver: webdriver.Chrome, phone: str, message: str) ->
     driver.get(url)
 
     try:
-        # Wait for the message compose box to appear (chat has loaded)
         compose_box = WebDriverWait(driver, CHAT_LOAD_TIMEOUT).until(
             EC.presence_of_element_located(
-                (By.XPATH, '//footer//div[@contenteditable="true"]')
+                (By.XPATH, COMPOSE_XPATH)
             )
         )
     except TimeoutException:
-        print(f"Could not load chat for {phone} (invalid number or WhatsApp didn't load in time). Skipping.")
+        print(f"Could not load chat for {phone}. Skipping.")
         return False
 
-    # Give WhatsApp a moment to finish injecting the pre-filled text
     time.sleep(2)
-
     compose_box.send_keys(Keys.ENTER)
-
-    # Brief pause to let the send request go through before navigating away
     time.sleep(3)
     return True
 
@@ -254,16 +239,18 @@ def send_whatsapp_message(driver: webdriver.Chrome, phone: str, message: str) ->
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    print(f"AI setup: {provider_summary()}\n")
+
     fallback_instruction = input(
         "Briefly describe the fallback message to use if personalization fails "
-        "for a contact (e.g. 'a friendly generic intro mentioning I sell pens'): "
+        "(e.g., 'a friendly generic intro mentioning I sell pens'): "
     ).strip()
 
     if not fallback_instruction:
         fallback_instruction = "a short, warm, generic WhatsApp introduction message"
 
     FALLBACK_MESSAGE = generate_fallback_message(fallback_instruction)
-    print(f"Fallback message ready: {FALLBACK_MESSAGE}")
+    print(f"Fallback message ready: {FALLBACK_MESSAGE}\n")
 
     contacts = load_contacts(CSV_FILE)
 
@@ -283,15 +270,14 @@ if __name__ == "__main__":
 
                 if message is None:
                     message = FALLBACK_MESSAGE
-                    print(f"[{phone}] Personalization failed — using fallback message.")
+                    print(f"[{phone}] AI generation failed — using fallback message.")
 
-                print(f"[{phone}] Generated message: {message}")
+                print(f"[{phone}] Generated: {message}")
 
                 sent = send_whatsapp_message(driver, phone, message)
-                print(f"[{phone}] {'Sent' if sent else 'FAILED to send'}")
+                print(f"[{phone}] {'✓ Sent' if sent else '✗ FAILED'}\n")
 
             print("Done!")
         finally:
-            # Keep the browser open briefly so you can visually confirm the last send
             time.sleep(3)
             driver.quit()

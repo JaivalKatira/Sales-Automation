@@ -1,3 +1,44 @@
+"""
+Lead Gen -> WhatsApp Company Profile Pipeline
+==============================================
+
+Purpose: takes Google Maps data and ENRICHES it with web search (searching
+for each company found on Maps) to find additional contact info (email/phone).
+Then verifies WhatsApp numbers. Optimized for lead quality over quantity.
+
+Outputs (in ./data/):
+    leads_master.csv     -> full lead data (name, phone, website, email,
+                             address, source keyword, date found). Every
+                             lead found, whether or not it had a phone
+                             number.
+    company_profile.csv  -> ONLY leads with a usable phone number, tagged
+                             with WhatsApp verification status and
+                             vertical-fit judgment. Ready for context.py.
+
+Sources combined:
+1. Google Maps Places API  -> business name, address, phone, website
+2. Web Enrichment (SerpAPI / DuckDuckGo) -> searches for each company name
+                               to find additional contact info (email/phone)
+                               not already found on Maps
+3. Site enrichment         -> scrapes the websites found for email addresses
+                               (no CAPTCHA risk on this step)
+4. Selenium / web.whatsapp.com -> verifies each phone-having lead's number
+                               is a real WhatsApp number, reusing the same
+                               persistent browser profile whatapp_sender.py
+                               logs into (no second QR-code scan needed)
+
+Setup before running:
+    pip install googlemaps requests beautifulsoup4 lxml python-dotenv phonenumbers selenium google-search-results duckduckgo-search
+    Create a .env file next to this script with:
+        GOOGLE_MAPS_API_KEY=your_maps_key_here
+        SERP_API_KEY=your_serp_api_key_here      (optional, falls back to DuckDuckGo)
+
+Run:
+    python3 Lead_Generator.py
+    -> you'll be prompted for a location, comma-separated keywords, and a
+       one-line goal describing what you want out of these leads
+"""
+
 import csv
 import os
 import re

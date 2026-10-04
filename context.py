@@ -1,3 +1,53 @@
+"""
+Context Generation Stage (Groq primary, Google Gemini fallback)
+================================================================
+
+Purpose: reads company_profile.csv (Lead_Generator.py's output) and, for
+every eligible lead, generates TWO personalized outreach *instructions* -
+NOT finished messages - one for WhatsApp and one for email. Downstream
+sender scripts (whatapp_sender.py / email_sender.py) use these
+instructions as prompts to actually draft the short message/email they
+send.
+
+Critical contract (do not violate): a downstream sender script that reads
+this CSV and feeds a context column straight into an AI call as a prompt
+will "rewrite" an already-final text and mangle it if this file wrote a
+finished message instead of an instruction. Every value written to the
+WhatsApp_Context / Email_Context columns below must read like an
+instruction ("Write a short, warm WhatsApp message mentioning X, Y, in a
+friendly tone..."), never like a message itself.
+
+Where this fits in the pipeline:
+    Lead_Generator.py -> company_profile.csv -> context.py (THIS FILE)
+        -> sender.csv -> whatapp_sender.py / email_sender.py
+
+AI providers (see ai_provider.py, which must sit in the same folder):
+    1. Groq          (primary)   GROQ_API_KEY,   model openai/gpt-oss-120b
+    2. Google Gemini (fallback)  GOOGLE_API_KEY, model gemini-3.5-flash-lite
+    3. A generic goal-based instruction if both fail for a lead
+
+Setup before running:
+    pip install python-dotenv openai
+    .env needs GROQ_API_KEY and GOOGLE_API_KEY (models are optional overrides,
+    see ai_provider.py).
+
+Run:
+    python3 context.py
+    -> you'll be prompted for your final goal for these leads
+
+Output (in ./data/):
+    sender.csv  -> Company, WhatsApp_Context, Email_Context, Number, Email
+                    (Company: lead's business name.
+                     WhatsApp_Context: instruction for the WhatsApp sender's
+                       AI call to draft a short WhatsApp message from.
+                     Email_Context: instruction for an email sender's AI
+                       call to draft a short cold-email opener from.
+                     Number: the lead's phone number, used by the WhatsApp
+                       sender to address the chat.
+                     Email: the lead's email address, carried through from
+                       company_profile.csv for an email sender to use.)
+"""
+
 import csv
 import os
 import random
