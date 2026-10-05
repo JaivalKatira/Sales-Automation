@@ -68,7 +68,11 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (
+    NoAlertPresentException,
+    TimeoutException,
+    UnexpectedAlertPresentException,
+)
 
 load_dotenv()
 
@@ -132,44 +136,81 @@ def normalize_country_code(raw: str) -> str | None:
     return f"+{digits}"
 
 
+def region_for_dial_code(country_code: str | None) -> str | None:
+    """'+51' -> 'PE', '+91' -> 'IN'. None if the dial code is unknown."""
+    if not country_code:
+        return None
+    try:
+        region = phonenumbers.region_code_for_country_code(int(country_code.lstrip("+")))
+    except ValueError:
+        return None
+    # "ZZ" means the dial code doesn't exist.
+    return region if region and region != "ZZ" else None
+
+
 def clean_phone(raw: str, country_code: str | None = None) -> str:
     """
     Normalize a phone number into E.164 ('+<countrycode><number>') using
     the phonenumbers library.
-    - If raw already starts with '+', parse it as-is (it's self-describing).
-    - Otherwise, strip non-digits, drop a single leading trunk '0' (common
-      domestic-format leading zero), and prepend the user-supplied
-      country_code (e.g. '+91') before parsing.
+
+    Tries, in order, and returns the first valid result:
+      1. Self-describing international format ('+51 1 234 5678').
+      2. Parsed with the REGION of the dial code you entered ('PE' for +51).
+         This is the important one: phonenumbers knows each country's own
+         trunk prefixes and quirks (Peru's '01' Lima area code, Argentina's
+         '0' + '15' mobile prefixes, Mexico's old '044'/'045', Italy keeping
+         its leading 0, ...). The old code blindly deleted a leading 0 and
+         glued the dial code on, which broke many non-Indian numbers.
+      3. Digits that already start with the dial code but lack the '+'
+         ('51987654321').
+      4. Legacy fallback: strip one leading 0 and prepend the dial code.
     Returns '' if nothing validates.
     """
     if not raw:
         return ""
+    raw = raw.strip()
 
-    def _validate(candidate: str) -> str | None:
-        try:
-            parsed = phonenumbers.parse(candidate, None)
-        except phonenumbers.NumberParseException:
-            return None
+    def _to_e164(parsed) -> str | None:
         if phonenumbers.is_valid_number(parsed):
             return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
         return None
 
-    raw = raw.strip()
+    def _try(candidate: str, region: str | None) -> str | None:
+        try:
+            return _to_e164(phonenumbers.parse(candidate, region))
+        except phonenumbers.NumberParseException:
+            return None
+
+    # 1. Already international.
     if raw.startswith("+"):
-        result = _validate(raw)
+        result = _try(raw, None)
         if result:
             return result
-        # Fall through in case it's malformed (e.g. stray characters) but
-        # otherwise usable once we strip it down and re-add the dial code.
+
+    region = region_for_dial_code(country_code)
+
+    # 2. National format, parsed with the right country's rules.
+    if region:
+        result = _try(raw, region)
+        if result:
+            return result
 
     digits = re.sub(r"\D", "", raw)
     if not digits:
         return ""
-    if digits.startswith("0"):
-        digits = digits[1:]
 
+    # 3. Dial code present but '+' missing, e.g. '51987654321'.
     if country_code:
-        result = _validate(f"{country_code}{digits}")
+        dial = country_code.lstrip("+")
+        if digits.startswith(dial):
+            result = _try(f"+{digits}", None)
+            if result:
+                return result
+
+    # 4. Legacy fallback: drop one trunk '0', prepend the dial code.
+    if country_code:
+        national = digits[1:] if digits.startswith("0") else digits
+        result = _try(f"{country_code}{national}", None)
         if result:
             return result
 
@@ -193,9 +234,17 @@ def search_google_maps(keyword: str, location: str, country_code: str,
             if place_id:
                 details = gmaps.place(
                     place_id=place_id,
-                    fields=["name", "formatted_address", "formatted_phone_number", "website"],
+                    fields=["name", "formatted_address", "formatted_phone_number",
+                            "international_phone_number", "website"],
                 ).get("result", {})
-            phone_raw = details.get("formatted_phone_number", "")
+            # Prefer Maps' international format ('+51 1 234 5678'): it names
+            # its own country, so no guessing is needed. Fall back to the
+            # national format, which clean_phone parses with the dial code.
+            phone_intl = details.get("international_phone_number", "")
+            phone_national = details.get("formatted_phone_number", "")
+            phone_raw = phone_intl or phone_national
+            phone_clean = (clean_phone(phone_intl, country_code=country_code)
+                           or clean_phone(phone_national, country_code=country_code))
             address = details.get("formatted_address", place.get("formatted_address", ""))
 
             results.append({
@@ -203,7 +252,7 @@ def search_google_maps(keyword: str, location: str, country_code: str,
                 "website": details.get("website", ""),
                 "email": "",
                 "phone": phone_raw,
-                "phone_clean": clean_phone(phone_raw, country_code=country_code),
+                "phone_clean": phone_clean,
                 "address": address,
                 "keyword": keyword,
                 "date_found": date.today().isoformat(),
@@ -361,6 +410,10 @@ def build_driver():
     options.add_argument(f"--user-data-dir={PROFILE_DIR}")
     options.add_argument("--profile-directory=Default")
     options.add_argument("--start-maximized")
+    # Force English so the "invalid number" dialog text is predictable
+    # (a non-English browser would show it in another language).
+    options.add_argument("--lang=en-US")
+    options.add_argument("--disable-popup-blocking")
     driver = webdriver.Chrome(options=options)
     driver.get("https://web.whatsapp.com")
     return driver
@@ -378,53 +431,105 @@ def wait_for_login(driver, timeout: int = 60) -> bool:
         return False
 
 
-def check_whatsapp_number(driver, phone_clean: str, timeout: int = 20) -> str:
+# The chat's message box lives inside <footer>. The old XPath
+# (//div[@contenteditable='true'][@data-tab]) also matched the SIDEBAR
+# search box, which exists as soon as you're logged in, so it could say
+# "Yes" before WhatsApp had even decided whether the number was valid.
+COMPOSE_XPATH = '//footer//div[@contenteditable="true"]'
+
+# Case-insensitive match on the invalid-number popup. Matching just "invalid"
+# (not the full sentence) survives small wording changes by WhatsApp.
+_LOWER = "translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+INVALID_XPATH = (
+    f'//div[@role="dialog"]//*[contains({_LOWER}, "invalid")] | '
+    f'//div[@role="dialog"]//*[contains({_LOWER}, "not on whatsapp")] | '
+    f'//div[@role="dialog"]//*[contains({_LOWER}, "isn\'t on whatsapp")] | '
+    f'//*[contains({_LOWER}, "phone number shared via url is invalid")]'
+)
+
+VERIFY_TIMEOUT = 40      # full page reload of WhatsApp Web can be slow
+VERIFY_ATTEMPTS = 2      # retry once before giving up with "Unverified"
+
+
+def _dismiss_alert(driver) -> None:
+    """Accept a 'Leave site?' / beforeunload popup if one is blocking us."""
+    try:
+        driver.switch_to.alert.accept()
+    except NoAlertPresentException:
+        pass
+    except Exception:
+        pass
+
+
+def _check_once(driver, phone_clean: str, timeout: int) -> str:
+    digits = re.sub(r"\D", "", phone_clean)
+    url = f"https://web.whatsapp.com/send?phone={digits}"
+
+    try:
+        driver.get(url)
+    except UnexpectedAlertPresentException:
+        _dismiss_alert(driver)
+        try:
+            driver.get(url)
+        except Exception as e:
+            print(f"  [WhatsApp] Navigation failed for {phone_clean}: {e}")
+            return "Unverified"
+    except Exception as e:
+        print(f"  [WhatsApp] Navigation failed for {phone_clean}: {e}")
+        return "Unverified"
+
+    # Poll for BOTH outcomes at once, so an invalid-number popup is seen the
+    # moment it appears instead of after a long wait for a box that never
+    # comes.
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if driver.find_elements(By.XPATH, COMPOSE_XPATH):
+                return "Yes"
+            if driver.find_elements(By.XPATH, INVALID_XPATH):
+                return "No"
+        except UnexpectedAlertPresentException:
+            _dismiss_alert(driver)
+        time.sleep(1)
+
+    return "Unverified"
+
+
+def check_whatsapp_number(driver, phone_clean: str, timeout: int = VERIFY_TIMEOUT) -> str:
     """
     Navigates to web.whatsapp.com/send?phone=<digits> and inspects the
     result:
-      - compose box loads within timeout -> "Yes"
-      - WhatsApp's "invalid phone number" dialog appears -> "No"
-      - neither happens within timeout -> "Unverified" (logged, not fatal)
+      - chat message box (inside <footer>) appears   -> "Yes"
+      - WhatsApp's "invalid phone number" popup      -> "No"
+      - neither appears in time (after a retry)      -> "Unverified"
+    On "Unverified" a screenshot and the visible page text are saved to
+    ./data/whatsapp_unverified_<digits>.png/.txt so you can SEE what
+    WhatsApp showed (QR code? logged out? a new popup wording?).
     Does NOT send a message or press Enter — read-only check.
     """
     if not phone_clean:
         return "Unverified"
 
-    digits = re.sub(r"[+\s\-]", "", phone_clean)
-    url = f"https://web.whatsapp.com/send?phone={digits}"
+    result = "Unverified"
+    for attempt in range(1, VERIFY_ATTEMPTS + 1):
+        result = _check_once(driver, phone_clean, timeout)
+        if result != "Unverified":
+            return result
+        if attempt < VERIFY_ATTEMPTS:
+            print(f"  [WhatsApp] No answer for {phone_clean}, retrying ({attempt}/{VERIFY_ATTEMPTS - 1})...")
 
+    print(f"  [WhatsApp] Couldn't confirm valid/invalid for {phone_clean} — marking Unverified")
     try:
-        driver.get(url)
-    except Exception as e:
-        print(f"  [WhatsApp] Navigation failed for {phone_clean}: {e}")
-        return "Unverified"
-
-    # Happy path: the message compose box loads -> valid WhatsApp number.
-    try:
-        WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//div[@contenteditable='true'][@data-tab]")
-            )
-        )
-        return "Yes"
-    except TimeoutException:
+        digits = re.sub(r"\D", "", phone_clean)
+        base = os.path.join(DATA_DIR, f"whatsapp_unverified_{digits}")
+        driver.save_screenshot(base + ".png")
+        page_text = driver.find_element(By.TAG_NAME, "body").text
+        with open(base + ".txt", "w", encoding="utf-8") as f:
+            f.write(page_text)
+        print(f"    Saved {os.path.basename(base)}.png / .txt in data/ to show what WhatsApp displayed.")
+    except Exception:
         pass
-
-    # Invalid-number path: WhatsApp shows a dialog to that effect.
-    # NOTE: this XPath is based on WhatsApp Web's known wording as of this
-    # writing and may need adjusting against a live run if WhatsApp changes
-    # the dialog's text/markup — treat a mismatch here as expected, not a
-    # sign the surrounding logic is wrong.
-    try:
-        WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//*[contains(text(), 'Phone number shared via url is invalid')]")
-            )
-        )
-        return "No"
-    except TimeoutException:
-        print(f"  [WhatsApp] Couldn't confirm valid/invalid for {phone_clean} — marking Unverified")
-        return "Unverified"
+    return "Unverified"
 
 
 # ---------------- CSV output ----------------
