@@ -1,0 +1,10 @@
+streamlit>=1.39
+pandas>=2.0
+openai>=1.0
+googlemaps>=4.10
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+phonenumbers>=8.13
+google-search-results>=2.4
+duckduckgo-search>=6.0
