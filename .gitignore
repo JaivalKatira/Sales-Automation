@@ -1,0 +1,9 @@
+.env
+.streamlit/secrets.toml
+
+__pycache__/
+*.pyc
+
+whatsapp_selenium_profile/
+
+data/*.csv
