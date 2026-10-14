@@ -1,7 +1,7 @@
 # Streamlit Sales Automation
 
 ## GitHub / Streamlit Cloud
-1. Push this folder to GitHub.
+1. Push this folder to GitHub
 2. In Streamlit Community Cloud, create an app and choose `build.py` as the entry file.
 3. Open App settings → Secrets and paste the values from `.streamlit/secrets.toml.example` with real credentials.
 4. Deploy.
